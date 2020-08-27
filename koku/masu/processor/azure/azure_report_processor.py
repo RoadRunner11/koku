@@ -28,6 +28,7 @@ from django.conf import settings
 
 from masu.config import Config
 from masu.database.azure_report_db_accessor import AzureReportDBAccessor
+from masu.database.multiconnect_db_accessor import MCDBAccessor
 from masu.processor.report_processor_base import ReportProcessorBase
 from masu.util import common as utils
 from reporting.provider.azure.models import AzureCostEntryBill
@@ -140,7 +141,7 @@ class AzureReportProcessor(ReportProcessorBase):
 
         return json.dumps(tag_dict)
 
-    def _create_cost_entry_bill(self, row, report_db_accessor):
+    def _create_cost_entry_bill(self, row, mc_db_accessor):
         """Create a cost entry bill object.
 
         Args:
@@ -150,7 +151,7 @@ class AzureReportProcessor(ReportProcessorBase):
             (str): A cost entry bill object id
 
         """
-        table_name = AzureCostEntryBill
+        table_name = AzureCostEntryBill._meta.db_table
         row_date = row.get("UsageDateTime")
 
         report_date_range = utils.month_date_range(parser.parse(row_date))
@@ -172,15 +173,15 @@ class AzureReportProcessor(ReportProcessorBase):
         data["billing_period_start"] = datetime.strftime(start_date_utc, "%Y-%m-%d %H:%M%z")
         data["billing_period_end"] = datetime.strftime(end_date_utc, "%Y-%m-%d %H:%M%z")
 
-        bill_id = report_db_accessor.insert_on_conflict_do_nothing(
-            table_name, data, conflict_columns=["billing_period_start", "provider_id"]
+        bill_id = mc_db_accessor.insert_on_conflict_do_nothing(
+            table_name, data, conflict_cols=["billing_period_start", "provider_id"], returning=["id"]
         )
 
         self.processed_report.bills[key] = bill_id
 
         return bill_id
 
-    def _create_cost_entry_product(self, row, report_db_accessor):
+    def _create_cost_entry_product(self, row, mc_db_accessor):
         """Create a cost entry product object.
 
         Args:
@@ -190,7 +191,7 @@ class AzureReportProcessor(ReportProcessorBase):
             (str): The DB id of the product object
 
         """
-        table_name = AzureCostEntryProductService
+        table_name = AzureCostEntryProductService._meta.db_table
         instance_id = row.get("InstanceId")
         additional_info = row.get("AdditionalInfo")
         service_name = row.get("ServiceName")
@@ -217,13 +218,14 @@ class AzureReportProcessor(ReportProcessorBase):
             return
         data["instance_type"] = instance_type
         data["provider_id"] = self._provider_uuid
-        product_id = report_db_accessor.insert_on_conflict_do_nothing(
-            table_name, data, conflict_columns=["instance_id", "instance_type", "service_tier", "service_name"]
+        conflict_columns = ["instance_id", "instance_type", "service_tier", "service_name"]
+        product_id = mc_db_accessor.insert_on_conflict_do_nothing(
+            table_name, data, conflict_cols=conflict_columns, returning=["id"]
         )
         self.processed_report.products[key] = product_id
         return product_id
 
-    def _create_meter(self, row, report_db_accessor):
+    def _create_meter(self, row, mc_db_accessor):
         """Create a cost entry product object.
 
         Args:
@@ -233,7 +235,7 @@ class AzureReportProcessor(ReportProcessorBase):
             (str): The DB id of the product object
 
         """
-        table_name = AzureMeter
+        table_name = AzureMeter._meta.db_table
         meter_id = row.get("MeterId")
 
         key = (meter_id,)
@@ -249,7 +251,9 @@ class AzureReportProcessor(ReportProcessorBase):
         if value_set == {""}:
             return
         data["provider_id"] = self._provider_uuid
-        meter_id = report_db_accessor.insert_on_conflict_do_nothing(table_name, data, conflict_columns=["meter_id"])
+        meter_id = mc_db_accessor.insert_on_conflict_do_nothing(
+            table_name, data, conflict_cols=["meter_id"], returning=["id"]
+        )
         self.processed_report.meters[key] = meter_id
         return meter_id
 
@@ -284,11 +288,14 @@ class AzureReportProcessor(ReportProcessorBase):
         if self.line_item_columns is None:
             self.line_item_columns = list(data.keys())
 
-    def create_cost_entry_objects(self, row, report_db_accesor):
+    def create_cost_entry_objects(self, row, report_db_accesor, mc_db_accessor):
         """Create the set of objects required for a row of data."""
-        bill_id = self._create_cost_entry_bill(row, report_db_accesor)
-        product_id = self._create_cost_entry_product(row, report_db_accesor)
-        meter_id = self._create_meter(row, report_db_accesor)
+        # These three calls are using the mc_db_accessor which will utilize a separate,
+        # dedicated connection to the application database in autocommit mode so that
+        # record values that will be created/checked across multiple discrete processes
+        bill_id = self._create_cost_entry_bill(row, mc_db_accessor)
+        product_id = self._create_cost_entry_product(row, mc_db_accessor)
+        meter_id = self._create_meter(row, mc_db_accessor)
 
         self._create_cost_entry_line_item(row, bill_id, product_id, meter_id, report_db_accesor)
 
@@ -307,14 +314,16 @@ class AzureReportProcessor(ReportProcessorBase):
         opener, mode = self._get_file_opener(self._compression)
         with opener(self._report_path, mode, encoding="utf-8-sig") as f:
             header = normalize_header(f.readline())
-            with AzureReportDBAccessor(self._schema) as report_db:
+            with AzureReportDBAccessor(self._schema) as report_db, MCDBAccessor(
+                self._schema
+            ) as mc_db:  # mc_db will create a new autocommit connection for shared records
                 temp_table = report_db.create_temp_table(self.table_name._meta.db_table, drop_column="id")
                 LOG.info("File %s opened for processing", str(f))
                 reader = csv.DictReader(f, fieldnames=header)
                 for row in reader:
                     if not self._should_process_row(row, "UsageDateTime", is_full_month):
                         continue
-                    self.create_cost_entry_objects(row, report_db)
+                    self.create_cost_entry_objects(row, report_db, mc_db)
                     if len(self.processed_report.line_items) >= self._batch_size:
                         LOG.info(
                             "Saving report rows %d to %d for %s",
